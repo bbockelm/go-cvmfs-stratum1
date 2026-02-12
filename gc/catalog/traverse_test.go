@@ -289,3 +289,175 @@ func TestTraverseDeepTree(t *testing.T) {
 	t.Logf("Deep tree traversal complete: %d hashes, %d catalog nodes (parallelism=%d)",
 		len(hashes), totalNodes, parallelism)
 }
+
+// TestCatalogHashSet verifies that TraverseFromRootHash populates the
+// Progress.CatalogHashes set with every catalog hash encountered.
+func TestCatalogHashSet(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	tempDir := t.TempDir()
+
+	rootHash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	nested1 := "1111111111111111111111111111111111111111"
+	nested2 := "2222222222222222222222222222222222222222"
+	leaf := "3333333333333333333333333333333333333333"
+
+	// Root has two nested catalogs.
+	writeCatalogDB(t, dataDir, rootHash, nil, []string{nested1, nested2})
+	// nested1 has one further nested catalog.
+	writeCatalogDB(t, dataDir, nested1, []string{"aabbccdd00112233aabbccdd00112233aabbccdd"}, []string{leaf})
+	// nested2 and leaf are leaves.
+	writeCatalogDB(t, dataDir, nested2, []string{"eeff00112233445566778899aabbccddeeff0011"}, nil)
+	writeCatalogDB(t, dataDir, leaf, []string{"00112233445566778899aabbccddeeff00112233"}, nil)
+
+	cfg := TraverseConfig{DataDir: dataDir, Parallelism: 2, TempDir: tempDir}
+	out := make(chan Hash, 1024)
+	var prog Progress
+
+	done := make(chan error, 1)
+	go func() { done <- TraverseFromRootHash(cfg, rootHash, out, &prog) }()
+
+	for range out {
+		// drain
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	seen := prog.CatalogHashSet()
+	expected := []string{rootHash, nested1, nested2, leaf}
+	for _, h := range expected {
+		if _, ok := seen[h]; !ok {
+			t.Errorf("CatalogHashSet missing: %s", h)
+		}
+	}
+	if len(seen) != len(expected) {
+		t.Errorf("CatalogHashSet has %d entries, want %d", len(seen), len(expected))
+	}
+	t.Logf("CatalogHashSet: %d entries (expected %d)", len(seen), len(expected))
+}
+
+// TestTraverseNewCatalogs verifies that TraverseNewCatalogs skips catalogs
+// already in the seen set and only emits hashes from new catalogs.
+func TestTraverseNewCatalogs(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	tempDir := t.TempDir()
+
+	// Scenario: initial tree has root→A→B.
+	// After a "publish", root' has a new hash, A is unchanged, but a new
+	// catalog C was added.
+	oldRoot := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	catA := "1111111111111111111111111111111111111111"
+	catB := "2222222222222222222222222222222222222222"
+	newRoot := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	catC := "3333333333333333333333333333333333333333"
+
+	contentA := "aabbccdd00112233aabbccdd00112233aabbccdd"
+	contentB := "eeff00112233445566778899aabbccddeeff0011"
+	contentC := "00112233445566778899aabbccddeeff00112233"
+
+	// The old tree (still on disk, needed so catA/catB can be found).
+	writeCatalogDB(t, dataDir, oldRoot, nil, []string{catA})
+	writeCatalogDB(t, dataDir, catA, []string{contentA}, []string{catB})
+	writeCatalogDB(t, dataDir, catB, []string{contentB}, nil)
+
+	// The new root points to catA (unchanged) and catC (new).
+	writeCatalogDB(t, dataDir, newRoot, nil, []string{catA, catC})
+	writeCatalogDB(t, dataDir, catC, []string{contentC}, nil)
+
+	// Seen set from initial pass: oldRoot, catA, catB.
+	seen := map[string]struct{}{
+		oldRoot: {},
+		catA:    {},
+		catB:    {},
+	}
+
+	cfg := TraverseConfig{DataDir: dataDir, Parallelism: 2, TempDir: tempDir}
+	out := make(chan Hash, 1024)
+
+	done := make(chan error, 1)
+	go func() { done <- TraverseNewCatalogs(cfg, newRoot, seen, out, nil) }()
+
+	var hashes []Hash
+	timeout := time.After(10 * time.Second)
+	draining := true
+	for draining {
+		select {
+		case h, ok := <-out:
+			if !ok {
+				draining = false
+			} else {
+				hashes = append(hashes, h)
+			}
+		case <-timeout:
+			t.Fatal("TraverseNewCatalogs timed out")
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	// We expect:
+	//   newRoot catalog hash (SuffixCatalog) — emitted as the new root
+	//   catC catalog hash (SuffixCatalog)    — new nested catalog
+	//   contentC (SuffixNone)                — content from catC
+	// catA is in seen set → skipped entirely (including catB).
+	hashSet := make(map[string]bool)
+	for _, h := range hashes {
+		hashSet[h.Hex] = true
+	}
+
+	if !hashSet[newRoot] {
+		t.Error("expected newRoot in output")
+	}
+	if !hashSet[catC] {
+		t.Error("expected catC in output")
+	}
+	if !hashSet[contentC] {
+		t.Error("expected contentC in output")
+	}
+	if hashSet[catA] {
+		t.Error("catA should have been skipped (in seen set)")
+	}
+	if hashSet[catB] {
+		t.Error("catB should have been skipped (catA was skipped)")
+	}
+	if hashSet[contentA] {
+		t.Error("contentA should not appear (catA was skipped)")
+	}
+	if hashSet[contentB] {
+		t.Error("contentB should not appear (catB was skipped)")
+	}
+
+	t.Logf("TraverseNewCatalogs: %d hashes emitted (expected 3)", len(hashes))
+}
+
+// TestTraverseNewCatalogsUnchangedRoot verifies that when the root hash
+// is in the seen set, no hashes are emitted and the channel closes.
+func TestTraverseNewCatalogsUnchangedRoot(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	tempDir := t.TempDir()
+
+	rootHash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	writeCatalogDB(t, dataDir, rootHash, []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, nil)
+
+	seen := map[string]struct{}{rootHash: {}}
+
+	cfg := TraverseConfig{DataDir: dataDir, Parallelism: 2, TempDir: tempDir}
+	out := make(chan Hash, 1024)
+
+	done := make(chan error, 1)
+	go func() { done <- TraverseNewCatalogs(cfg, rootHash, seen, out, nil) }()
+
+	var hashes []Hash
+	for h := range out {
+		hashes = append(hashes, h)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	if len(hashes) != 0 {
+		t.Errorf("expected 0 hashes for unchanged root, got %d", len(hashes))
+	}
+	t.Log("Unchanged root: correctly emitted 0 hashes")
+}

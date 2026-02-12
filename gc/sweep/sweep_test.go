@@ -268,3 +268,162 @@ func TestSweepDeletedBySuffix(t *testing.T) {
 		stats.DeletedBySuffix[0], stats.DeletedBySuffix['P'],
 		stats.DeletedBySuffix['C'], stats.DeletedBySuffix['L'])
 }
+
+func TestCollectCandidates(t *testing.T) {
+	tmpDir := t.TempDir()
+	dataDir := filepath.Join(tmpDir, "data")
+
+	reachable := []string{
+		"aa" + pad("1111", 38),
+		"bb" + pad("2222", 38),
+	}
+	unreachable := []string{
+		"aa" + pad("9999", 38),
+		"cc" + pad("3333", 38),
+	}
+
+	for _, h := range append(reachable, unreachable...) {
+		dir := filepath.Join(dataDir, h[:2])
+		os.MkdirAll(dir, 0755)
+		f, _ := os.Create(filepath.Join(dir, h[2:]))
+		f.WriteString("dummy")
+		f.Close()
+	}
+
+	sort.Strings(reachable)
+	chunkDir := filepath.Join(tmpDir, "chunks")
+	os.MkdirAll(chunkDir, 0755)
+	chunkPath := filepath.Join(chunkDir, "chunk-000000.txt")
+	hf, _ := os.Create(chunkPath)
+	for _, h := range reachable {
+		hf.WriteString(h + "\n")
+	}
+	hf.Close()
+
+	cfg := Config{
+		DataDir:    dataDir,
+		ChunkFiles: []string{chunkPath},
+	}
+
+	var stats Stats
+	candidates, err := CollectCandidates(cfg, &stats)
+	if err != nil {
+		t.Fatalf("CollectCandidates: %v", err)
+	}
+
+	if len(candidates) != len(unreachable) {
+		t.Errorf("got %d candidates, want %d", len(candidates), len(unreachable))
+	}
+
+	for _, h := range unreachable {
+		if _, ok := candidates[h]; !ok {
+			t.Errorf("missing candidate: %s", h)
+		}
+	}
+	for _, h := range reachable {
+		if _, ok := candidates[h]; ok {
+			t.Errorf("reachable hash should not be a candidate: %s", h)
+		}
+	}
+
+	// Files should still exist — CollectCandidates doesn't delete.
+	for _, h := range unreachable {
+		p := filepath.Join(dataDir, h[:2], h[2:])
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			t.Errorf("CollectCandidates deleted a file: %s", h)
+		}
+	}
+
+	if stats.CandidatesFound != int64(len(unreachable)) {
+		t.Errorf("CandidatesFound: got %d, want %d", stats.CandidatesFound, len(unreachable))
+	}
+	t.Logf("Candidates: %d found, %d checked, %d retained",
+		stats.CandidatesFound, stats.FilesChecked, stats.FilesRetained)
+}
+
+func TestSubtractReachable(t *testing.T) {
+	candidates := map[string]Candidate{
+		"aa1111": {FullHash: "aa1111"},
+		"bb2222": {FullHash: "bb2222"},
+		"cc3333": {FullHash: "cc3333"},
+		"dd4444": {FullHash: "dd4444"},
+	}
+
+	reachable := map[string]struct{}{
+		"bb2222": {},
+		"dd4444": {},
+		"ee5555": {}, // not in candidates — should be harmless
+	}
+
+	var stats Stats
+	SubtractReachable(candidates, reachable, &stats)
+
+	if len(candidates) != 2 {
+		t.Errorf("expected 2 candidates after subtract, got %d", len(candidates))
+	}
+	if _, ok := candidates["aa1111"]; !ok {
+		t.Error("aa1111 should remain")
+	}
+	if _, ok := candidates["cc3333"]; !ok {
+		t.Error("cc3333 should remain")
+	}
+	if _, ok := candidates["bb2222"]; ok {
+		t.Error("bb2222 should have been subtracted")
+	}
+	if _, ok := candidates["dd4444"]; ok {
+		t.Error("dd4444 should have been subtracted")
+	}
+
+	if stats.CandidatesProtected != 2 {
+		t.Errorf("CandidatesProtected: got %d, want 2", stats.CandidatesProtected)
+	}
+}
+
+func TestDeleteCandidates(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create files to delete.
+	paths := make(map[string]string)
+	for _, name := range []string{"aa1111", "bb2222C", "cc3333P"} {
+		p := filepath.Join(tmpDir, name)
+		f, _ := os.Create(p)
+		f.WriteString("content")
+		f.Close()
+		paths[name] = p
+	}
+
+	candidates := map[string]Candidate{
+		"aa1111":  {FullHash: "aa1111", FilePath: paths["aa1111"]},
+		"bb2222C": {FullHash: "bb2222C", FilePath: paths["bb2222C"]},
+		"cc3333P": {FullHash: "cc3333P", FilePath: paths["cc3333P"]},
+	}
+
+	cfg := Config{DryRun: false}
+	var stats Stats
+	DeleteCandidates(candidates, cfg, &stats)
+
+	if stats.FilesDeleted != 3 {
+		t.Errorf("FilesDeleted: got %d, want 3", stats.FilesDeleted)
+	}
+	if stats.BytesFreed != 21 {
+		t.Errorf("BytesFreed: got %d, want 21", stats.BytesFreed)
+	}
+
+	// Check suffix counters.
+	if stats.DeletedBySuffix[0] != 1 {
+		t.Errorf("DeletedBySuffix[0]: got %d, want 1", stats.DeletedBySuffix[0])
+	}
+	if stats.DeletedBySuffix['C'] != 1 {
+		t.Errorf("DeletedBySuffix['C']: got %d, want 1", stats.DeletedBySuffix['C'])
+	}
+	if stats.DeletedBySuffix['P'] != 1 {
+		t.Errorf("DeletedBySuffix['P']: got %d, want 1", stats.DeletedBySuffix['P'])
+	}
+
+	// Files should be gone.
+	for name, p := range paths {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("file %s should have been deleted", name)
+		}
+	}
+}

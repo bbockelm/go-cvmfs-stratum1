@@ -1,25 +1,28 @@
 // Package sweep implements the GC sweep phase for CVMFS.
 //
-// It walks the data directory (2-hex-char prefix scheme) and removes any
-// file not present in the set of reachable hashes.
+// The sweep uses a two-pass algorithm designed to minimise the time the
+// repository lock is held:
 //
-// Algorithm:
+// Pass 1 — Candidate Collection (no lock required):
 //
-//  1. Open a ChunkMergeReader over the sorted chunk files. This streams
-//     the globally-sorted, deduplicated sequence of reachable hashes.
-//  2. Iterate prefixes "00".."ff" in lexicographic order. A pool of 3
-//     goroutines reads directories ahead so that ReadDir I/O overlaps
-//     with merge-join processing. Results are delivered in order via a
-//     sliding-window of per-prefix channels.  For each prefix:
-//     a. The entries from os.ReadDir are already sorted by name and share
-//        the same 2-char prefix, so they are in global sorted order.
-//     b. Merge-join the sorted directory entries against the merge reader.
-//        Both are in the same global sorted order, so this is a simple
-//        two-pointer advance. Any directory entry not matched is deleted.
+//  1. Open a ChunkMergeReader over the sorted chunk files produced by
+//     Phase 1 (catalog traversal → semi-sort → chunk-sort).
+//  2. Iterate prefixes "00".."ff" in lexicographic order with parallel
+//     read-ahead.  For each prefix, merge-join the sorted directory
+//     entries against the merge reader.  Any entry not matched is added
+//     to the candidate set.
 //
-// Because both the directory entries (sorted in-memory per prefix) and the
-// merge reader are in ascending order, the entire sweep is a single linear
-// pass over both streams. Memory usage is O(entries-in-one-directory).
+// Pass 2 — Locked Deletion:
+//
+//  4. Acquire the repository lock.
+//  5. Re-walk all catalogs from the (possibly updated) manifest to
+//     discover hashes that became reachable while we were scanning.
+//  6. Remove those hashes from the candidate set.
+//  7. Delete the remaining candidates.
+//  8. Release the lock.
+//
+// The existing Run() function preserves the original single-pass API for
+// backward compatibility and testing.
 package sweep
 
 import (
@@ -43,11 +46,11 @@ type Config struct {
 	// DryRun logs deletions without actually removing files.
 	DryRun bool
 	// OutputWriter, if non-nil, receives one hash per line for every
-	// unreachable object found during dry-run or deletion. The caller
+	// unreachable object found during dry-run or deletion.  The caller
 	// is responsible for flushing and closing the underlying file.
 	OutputWriter *bufio.Writer
 	// ReadAhead controls how many directory listings to issue in
-	// parallel. Defaults to 3 if <= 0.
+	// parallel.  Defaults to 3 if <= 0.
 	ReadAhead int
 }
 
@@ -62,13 +65,25 @@ type Stats struct {
 	Errors        int64
 	PrefixesDone  int64 // 0..256: how many of the 00..ff prefixes are complete
 
-	// Per-suffix deletion counters. Updated atomically.
+	// Per-suffix deletion counters.  Updated atomically.
 	// Suffixes: 0=none, 'C'=catalog, 'P'=partial, 'L'=micro-catalog,
 	// 'H'=history, 'X'=certificate, 'M'=metainfo.
 	DeletedBySuffix [256]int64
+
+	// Two-pass specific counters.
+	CandidatesFound    int64 // after pass 1 merge-join
+	CandidatesProtected int64 // removed by pass 2 delta
 }
 
-// suffixFromName extracts the CVMFS hash suffix from a filename. CVMFS
+// Candidate represents a file identified as potentially unreachable.
+type Candidate struct {
+	// FullHash is prefix + filename (e.g. "aa" + "bcdef...").
+	FullHash string
+	// FilePath is the absolute path on disk.
+	FilePath string
+}
+
+// suffixFromName extracts the CVMFS hash suffix from a filename.  CVMFS
 // filenames are the hash hex (minus the 2-char prefix directory), optionally
 // followed by a single ASCII suffix byte (C, P, L, H, X, M).
 func suffixFromName(name string) byte {
@@ -76,19 +91,22 @@ func suffixFromName(name string) byte {
 		return 0
 	}
 	last := name[len(name)-1]
-	// Valid suffixes are upper-case ASCII letters.
 	if last >= 'A' && last <= 'Z' {
 		return last
 	}
 	return 0
 }
 
-// Run performs the sweep. If stats is non-nil it is used to track progress
-// (fields are updated atomically); otherwise a new Stats is allocated.
-// It processes prefixes 00-ff sequentially (they must be in order to align
-// with the merge reader stream), but directory listing I/O for the next
-// several prefixes runs in parallel (controlled by cfg.ReadAhead, default 3).
-func Run(cfg Config, stats *Stats) (*Stats, error) {
+// ===================================================================
+// Pass 1: Candidate Collection
+// ===================================================================
+
+// CollectCandidates performs the merge-join sweep and returns a map of
+// unreachable hash → Candidate.  No files are deleted.
+//
+// The stats argument is updated atomically for progress reporting
+// (FilesChecked, FilesRetained, PrefixesDone, CandidatesFound).
+func CollectCandidates(cfg Config, stats *Stats) (map[string]Candidate, error) {
 	if stats == nil {
 		stats = &Stats{}
 	}
@@ -98,14 +116,16 @@ func Run(cfg Config, stats *Stats) (*Stats, error) {
 		readAhead = 3
 	}
 
+	candidates := make(map[string]Candidate)
+
 	if len(cfg.ChunkFiles) == 0 {
-		// No reachable hashes at all — delete everything.
+		// No reachable hashes at all — everything is a candidate.
 		for i := 0; i < 256; i++ {
 			prefix := fmt.Sprintf("%02x", i)
-			deleteAllInPrefix(cfg, prefix, stats)
+			collectAllInPrefix(cfg.DataDir, prefix, candidates, stats)
 			atomic.AddInt64(&stats.PrefixesDone, 1)
 		}
-		return stats, nil
+		return candidates, nil
 	}
 
 	reader, err := hashsort.NewChunkMergeReader(cfg.ChunkFiles)
@@ -115,70 +135,13 @@ func Run(cfg Config, stats *Stats) (*Stats, error) {
 	defer reader.Close()
 
 	// ---- Parallel directory read-ahead with in-order delivery ----
-	//
-	// We launch `readAhead` goroutines that pull prefix indices from a
-	// shared counter, perform os.ReadDir, and write the result into a
-	// per-slot channel. A collector goroutine reads slots 0..255 in
-	// order and forwards results to `dirCh`. This ensures the consumer
-	// always receives prefixes in sorted order while up to `readAhead`
-	// ReadDir calls overlap with processing.
-	type dirResult struct {
-		prefix  string
-		dirPath string
-		entries []os.DirEntry
-		missing bool
-		err     error
-	}
-
-	// One buffered-channel "slot" per prefix.
-	slots := make([]chan dirResult, 256)
-	for i := range slots {
-		slots[i] = make(chan dirResult, 1)
-	}
-
-	// Shared index counter for the worker pool.
-	var nextIdx int64
-
-	var wg sync.WaitGroup
-	for w := 0; w < readAhead; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				idx := int(atomic.AddInt64(&nextIdx, 1) - 1)
-				if idx >= 256 {
-					return
-				}
-				prefix := fmt.Sprintf("%02x", idx)
-				dirPath := filepath.Join(cfg.DataDir, prefix)
-				entries, err := os.ReadDir(dirPath)
-				if os.IsNotExist(err) {
-					slots[idx] <- dirResult{prefix: prefix, dirPath: dirPath, missing: true}
-					continue
-				}
-				slots[idx] <- dirResult{prefix: prefix, dirPath: dirPath, entries: entries, err: err}
-			}
-		}()
-	}
-
-	// Collector: read slots in order and forward to dirCh.
-	dirCh := make(chan dirResult, readAhead)
-	go func() {
-		for i := 0; i < 256; i++ {
-			dirCh <- <-slots[i]
-		}
-		wg.Wait()
-		close(dirCh)
-	}()
+	dirCh := startReadAhead(cfg.DataDir, readAhead)
 
 	// Prime the reader with the first hash.
 	readerValid := reader.Next()
 
 	for dr := range dirCh {
 		if dr.missing {
-			// Skip prefixes that have no directory.
-			// But we still need to advance the reader past any hashes
-			// with this prefix so it stays aligned.
 			for readerValid && reader.Value()[:2] == dr.prefix {
 				readerValid = reader.Next()
 			}
@@ -192,9 +155,6 @@ func Run(cfg Config, stats *Stats) (*Stats, error) {
 			continue
 		}
 
-		// Merge-join: entries from os.ReadDir are already sorted by
-		// name, and all share the same prefix, so they are in global
-		// sorted order. Walk them in lockstep with the merge reader.
 		hadFiles := false
 		for _, e := range dr.entries {
 			if e.IsDir() {
@@ -206,45 +166,26 @@ func Run(cfg Config, stats *Stats) (*Stats, error) {
 
 			atomic.AddInt64(&stats.FilesChecked, 1)
 
-			// Advance merge reader past entries that come before
-			// this file's hash.
+			// Advance merge reader past entries before this file.
 			for readerValid && reader.Value() < fullHash {
 				readerValid = reader.Next()
 			}
 
 			if readerValid && reader.Value() == fullHash {
-				// Reachable — keep it. Advance reader past this match.
 				atomic.AddInt64(&stats.FilesRetained, 1)
 				readerValid = reader.Next()
 				continue
 			}
 
-			// Not reachable — delete (or record).
-			suf := suffixFromName(name)
-			atomic.AddInt64(&stats.DeletedBySuffix[suf], 1)
-
-			filePath := filepath.Join(dr.dirPath, name)
-			if cfg.OutputWriter != nil {
-				fmt.Fprintln(cfg.OutputWriter, fullHash)
+			// Unreachable — record as candidate.
+			candidates[fullHash] = Candidate{
+				FullHash: fullHash,
+				FilePath: filepath.Join(dr.dirPath, name),
 			}
-			if cfg.DryRun {
-				atomic.AddInt64(&stats.FilesDeleted, 1)
-				continue
-			}
-
-			if err := os.Remove(filePath); err != nil {
-				log.Printf("WARNING: failed to delete %s: %v", filePath, err)
-				atomic.AddInt64(&stats.Errors, 1)
-			} else {
-				atomic.AddInt64(&stats.FilesDeleted, 1)
-				if info, err := e.Info(); err == nil {
-					atomic.AddInt64(&stats.BytesFreed, info.Size())
-				}
-			}
+			atomic.AddInt64(&stats.CandidatesFound, 1)
 		}
 
 		if !hadFiles {
-			// Advance reader past this prefix.
 			for readerValid && reader.Value()[:2] == dr.prefix {
 				readerValid = reader.Next()
 			}
@@ -252,13 +193,154 @@ func Run(cfg Config, stats *Stats) (*Stats, error) {
 		atomic.AddInt64(&stats.PrefixesDone, 1)
 	}
 
+	return candidates, nil
+}
+
+
+
+// ===================================================================
+// Pass 2: Delta Subtraction
+// ===================================================================
+
+// SubtractReachable removes any hash present in the reachable set from the
+// candidates map.  The reachable set is typically built from a catalog
+// re-walk performed under the repository lock.
+func SubtractReachable(candidates map[string]Candidate, reachable map[string]struct{}, stats *Stats) {
+	var removed int64
+	for hash := range reachable {
+		if _, ok := candidates[hash]; ok {
+			delete(candidates, hash)
+			removed++
+		}
+	}
+	if stats != nil {
+		atomic.AddInt64(&stats.CandidatesProtected, removed)
+	}
+}
+
+// ===================================================================
+// Deletion
+// ===================================================================
+
+// DeleteCandidates removes (or records in dry-run mode) the remaining
+// candidates.  It updates stats.FilesDeleted, BytesFreed, DeletedBySuffix,
+// and Errors.
+func DeleteCandidates(candidates map[string]Candidate, cfg Config, stats *Stats) {
+	if stats == nil {
+		stats = &Stats{}
+	}
+
+	for _, c := range candidates {
+		name := c.FullHash
+		suf := suffixFromName(name)
+		atomic.AddInt64(&stats.DeletedBySuffix[suf], 1)
+
+		if cfg.OutputWriter != nil {
+			fmt.Fprintln(cfg.OutputWriter, c.FullHash)
+		}
+
+		if cfg.DryRun {
+			atomic.AddInt64(&stats.FilesDeleted, 1)
+			continue
+		}
+
+		// Stat the file just before removal to get accurate size.
+		var sz int64
+		if fi, err := os.Lstat(c.FilePath); err == nil {
+			sz = fi.Size()
+		}
+
+		if err := os.Remove(c.FilePath); err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("WARNING: failed to delete %s: %v", c.FilePath, err)
+				atomic.AddInt64(&stats.Errors, 1)
+			}
+		} else {
+			atomic.AddInt64(&stats.FilesDeleted, 1)
+			atomic.AddInt64(&stats.BytesFreed, sz)
+		}
+	}
+}
+
+// ===================================================================
+// Single-pass Run (backward compatible)
+// ===================================================================
+
+// Run performs the sweep in a single pass (collect + delete without locking
+// or delta).  This preserves the original API for simple usage and testing.
+func Run(cfg Config, stats *Stats) (*Stats, error) {
+	if stats == nil {
+		stats = &Stats{}
+	}
+
+	candidates, err := CollectCandidates(cfg, stats)
+	if err != nil {
+		return stats, err
+	}
+
+	DeleteCandidates(candidates, cfg, stats)
 	return stats, nil
 }
 
-// deleteAllInPrefix deletes every file in a prefix directory (used when
-// there are no reachable hashes at all).
-func deleteAllInPrefix(cfg Config, prefix string, stats *Stats) {
-	dirPath := filepath.Join(cfg.DataDir, prefix)
+// ===================================================================
+// Read-ahead helpers
+// ===================================================================
+
+type dirResult struct {
+	prefix  string
+	dirPath string
+	entries []os.DirEntry
+	missing bool
+	err     error
+}
+
+// startReadAhead launches goroutines that read directories 00..ff in
+// parallel and delivers results in order via a channel.
+func startReadAhead(dataDir string, readAhead int) <-chan dirResult {
+	slots := make([]chan dirResult, 256)
+	for i := range slots {
+		slots[i] = make(chan dirResult, 1)
+	}
+
+	var nextIdx int64
+	var wg sync.WaitGroup
+	for w := 0; w < readAhead; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				idx := int(atomic.AddInt64(&nextIdx, 1) - 1)
+				if idx >= 256 {
+					return
+				}
+				prefix := fmt.Sprintf("%02x", idx)
+				dirPath := filepath.Join(dataDir, prefix)
+				entries, err := os.ReadDir(dirPath)
+				if os.IsNotExist(err) {
+					slots[idx] <- dirResult{prefix: prefix, dirPath: dirPath, missing: true}
+					continue
+				}
+				slots[idx] <- dirResult{prefix: prefix, dirPath: dirPath, entries: entries, err: err}
+			}
+		}()
+	}
+
+	dirCh := make(chan dirResult, readAhead)
+	go func() {
+		for i := 0; i < 256; i++ {
+			dirCh <- <-slots[i]
+		}
+		wg.Wait()
+		close(dirCh)
+	}()
+
+	return dirCh
+}
+
+// collectAllInPrefix adds every file in a prefix directory to the
+// candidates map (used when there are no reachable hashes at all).
+func collectAllInPrefix(dataDir, prefix string, candidates map[string]Candidate, stats *Stats) {
+	dirPath := filepath.Join(dataDir, prefix)
 	entries, err := os.ReadDir(dirPath)
 	if os.IsNotExist(err) {
 		return
@@ -274,31 +356,13 @@ func deleteAllInPrefix(cfg Config, prefix string, stats *Stats) {
 			continue
 		}
 		atomic.AddInt64(&stats.FilesChecked, 1)
-
 		name := e.Name()
-		filePath := filepath.Join(dirPath, name)
 		fullHash := prefix + name
 
-		suf := suffixFromName(name)
-		atomic.AddInt64(&stats.DeletedBySuffix[suf], 1)
-
-		if cfg.OutputWriter != nil {
-			fmt.Fprintln(cfg.OutputWriter, fullHash)
+		candidates[fullHash] = Candidate{
+			FullHash: fullHash,
+			FilePath: filepath.Join(dirPath, name),
 		}
-		if cfg.DryRun {
-			atomic.AddInt64(&stats.FilesDeleted, 1)
-			continue
-		}
-
-		info, _ := e.Info()
-		if err := os.Remove(filePath); err != nil {
-			log.Printf("WARNING: failed to delete %s: %v", filePath, err)
-			atomic.AddInt64(&stats.Errors, 1)
-		} else {
-			atomic.AddInt64(&stats.FilesDeleted, 1)
-			if info != nil {
-				atomic.AddInt64(&stats.BytesFreed, info.Size())
-			}
-		}
+		atomic.AddInt64(&stats.CandidatesFound, 1)
 	}
 }

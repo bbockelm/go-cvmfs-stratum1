@@ -18,12 +18,19 @@ import (
 type Progress struct {
 	CatalogsProcessed int64 // catalogs fully processed
 	HashesEmitted     int64 // content hashes sent to output channel
+
+        // CatalogHashes collects every catalog hash visited during
+        // traversal (root + all nested).  Populated by the dispatcher.
+        // Key: hex hash (string), Value: struct{}.
+        // Callers can use this to avoid re-walking known catalogs in a
+        // subsequent delta pass.
+        CatalogHashes sync.Map
 }
 
 // Hash represents a content-addressable hash with its suffix character.
 type Hash struct {
-	Hex    string // full hex-encoded hash
-	Suffix byte   // hash suffix character (0 for none)
+        Hex    string // full hex-encoded hash
+        Suffix byte   // hash suffix character (0 for none)
 }
 
 // String returns the hash with its suffix appended (if any).
@@ -111,6 +118,9 @@ func TraverseFromRootHash(cfg TraverseConfig, rootHash string, out chan<- Hash, 
 	go func() {
 		var queue []Hash
 		queue = append(queue, Hash{Hex: rootHash, Suffix: SuffixCatalog})
+		if prog != nil {
+			prog.CatalogHashes.Store(rootHash, struct{}{})
+		}
 		inFlight := 0
 
 		for {
@@ -143,6 +153,11 @@ func TraverseFromRootHash(cfg TraverseConfig, rootHash string, out chan<- Hash, 
 					inFlight--
 				} else {
 					queue = append(queue, nested...)
+					if prog != nil {
+						for _, h := range nested {
+							prog.CatalogHashes.Store(h.Hex, struct{}{})
+						}
+					}
 				}
 			}
 		}
@@ -384,6 +399,149 @@ func decompressZlib(src string, dst *os.File) error {
 	defer srcFile.Close()
 
 	return decompressZlibStream(srcFile, dst)
+}
+
+// TraverseNewCatalogs re-walks the catalog tree from rootHash but skips
+// any catalog whose hash is present in the seen set.  It emits content
+// hashes only from new (unseen) catalogs.
+//
+// Because CVMFS catalogs are content-addressed, a catalog with an
+// unchanged hash has unchanged content AND unchanged nested-catalog
+// references.  Therefore, when we encounter a seen catalog during BFS we
+// can prune the entire subtree.
+//
+// The typical use is under the repository lock after an initial unlocked
+// traversal: the caller passes the CatalogHashes from the first pass as
+// the seen set, and this function discovers hashes that became reachable
+// between the two passes.
+func TraverseNewCatalogs(cfg TraverseConfig, rootHash string, seen map[string]struct{}, out chan<- Hash, prog *Progress) error {
+	if cfg.Parallelism <= 0 {
+		cfg.Parallelism = 8
+	}
+
+	// If the root itself is unchanged, nothing new to discover.
+	if _, ok := seen[rootHash]; ok {
+		close(out)
+		return nil
+	}
+
+	// Root is new — emit it and start BFS.
+	out <- Hash{Hex: rootHash, Suffix: SuffixCatalog}
+
+	foundCh := make(chan []Hash, cfg.Parallelism)
+	catalogCh := make(chan Hash, cfg.Parallelism)
+	errCh := make(chan error, 1)
+	doneCh := make(chan struct{})
+
+	// ---------- dispatcher ----------
+	go func() {
+		var queue []Hash
+		queue = append(queue, Hash{Hex: rootHash, Suffix: SuffixCatalog})
+		inFlight := 0
+
+		for {
+			var sendCh chan Hash
+			var sendVal Hash
+			if len(queue) > 0 {
+				sendCh = catalogCh
+				sendVal = queue[0]
+			}
+
+			if len(queue) == 0 && inFlight == 0 {
+				close(catalogCh)
+				close(doneCh)
+				return
+			}
+
+			select {
+			case sendCh <- sendVal:
+				queue = queue[1:]
+				inFlight++
+			case nested, ok := <-foundCh:
+				if !ok {
+					continue
+				}
+				if nested == nil {
+					inFlight--
+				} else {
+					// Only enqueue catalogs we haven't seen.
+					for _, h := range nested {
+						if _, skip := seen[h.Hex]; !skip {
+							queue = append(queue, h)
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	// ---------- workers ----------
+	var workerWg sync.WaitGroup
+	for i := 0; i < cfg.Parallelism; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for catHash := range catalogCh {
+				// Use a proxy channel to filter out seen
+				// catalog hashes from the output.
+				proxy := make(chan Hash, 256)
+				go func() {
+					for h := range proxy {
+						// Drop catalog hashes that are in the seen set.
+						if h.Suffix == SuffixCatalog {
+							if _, skip := seen[h.Hex]; skip {
+								continue
+							}
+						}
+						out <- h
+					}
+				}()
+
+				nested, nHashes, err := processCatalog(cfg, catHash, proxy)
+				close(proxy)
+
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("catalog %s: %w", catHash.Hex, err):
+					default:
+					}
+				}
+				if prog != nil {
+					atomic.AddInt64(&prog.CatalogsProcessed, 1)
+					atomic.AddInt64(&prog.HashesEmitted, nHashes)
+				}
+				if len(nested) > 0 {
+					foundCh <- nested
+				}
+				foundCh <- nil
+			}
+		}()
+	}
+
+	go func() {
+		<-doneCh
+		workerWg.Wait()
+		close(out)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+// CatalogHashSet converts the sync.Map in Progress.CatalogHashes to a
+// plain map for use with TraverseNewCatalogs.  This is a convenience
+// helper since TraverseNewCatalogs takes a plain map for lock-free reads.
+func (p *Progress) CatalogHashSet() map[string]struct{} {
+	m := make(map[string]struct{})
+	p.CatalogHashes.Range(func(key, value interface{}) bool {
+		m[key.(string)] = struct{}{}
+		return true
+	})
+	return m
 }
 
 func init() {
